@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-# train_lora.py
+# -*- coding: utf-8 -*-
 """
-Train LoRA adapters for Animagine-XL (Stable Diffusion) + ControlNet.
+CPU-only LoRA training script for:
+- Stable Diffusion 1.x base + optional ControlNet condition
+- Train LoRA for UNet / text_encoder / (optional) ControlNet
+- Save LoRA weights as safetensors
 
-主要功能：
-- 在 UNet / text_encoder / (可选) ControlNet 注入 LoRA (LoRALinear)
-- 只训练 LoRA 参数，冻结原始模型参数
-- 支持 ControlNet 条件（edge/pose maps）
-- 保存 LoRA 为 safetensors（轻量），支持 resume/load
-
-Author: 生成脚本（根据项目 README 规范）
+数据约定:
+- 训练图片: data/processed/photos   (例如: realperson_000_image.png)
+- 控制图:   data/processed/edges    (例如: realperson_000_edge.png)
+  注意: edges 中混有动漫线条文件无妨；只有与 photos 成对匹配的 realperson_xxx_edge 会被用到
 """
 
 import os
 import argparse
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -25,24 +25,25 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 
-from accelerate import Accelerator
 from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel, DDPMScheduler
 from safetensors.torch import save_file as safetensors_save, load_file as safetensors_load
 
-# ---------------------
+DEVICE = torch.device("cpu")  # 强制 CPU
+
+
+# =====================
 # LoRA wrapper
-# ---------------------
+# =====================
 class LoRALinear(nn.Module):
     """
-    Wrap an nn.Linear with LoRA low-rank adapters.
+    Wrap an nn.Linear with LoRA adapters.
     out = orig(x) + scaling * (x @ A.T @ B.T)
-    where A: (r, in_features), B: (out_features, r)
     """
+
     def __init__(self, orig: nn.Linear, r: int = 4, alpha: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
         self.orig = orig
-        # keep original weight/bias but freeze them by default
         self.in_features = orig.in_features
         self.out_features = orig.out_features
         self.r = r
@@ -56,11 +57,9 @@ class LoRALinear(nn.Module):
             nn.init.normal_(self.lora_A, std=0.01)
             nn.init.zeros_(self.lora_B)
         else:
-            # placeholders for consistent attribute access
             self.register_parameter("lora_A", None)
             self.register_parameter("lora_B", None)
 
-        # freeze original params
         for p in self.orig.parameters():
             p.requires_grad = False
 
@@ -68,20 +67,22 @@ class LoRALinear(nn.Module):
         out = self.orig(x)
         if self.r > 0:
             xi = self.dropout(x) if self.dropout is not None else x
-            # (B, in) @ A.T -> (B, r); @ B.T -> (B, out)
             lora_out = (xi @ self.lora_A.T) @ self.lora_B.T
             out = out + lora_out * self.scaling
         return out
 
-# ---------------------
-# Helpers: patching & state collection
-# ---------------------
-def replace_linear_with_lora(module: nn.Module, r: int = 4, alpha: Optional[int] = None, dropout: float = 0.0,
-                             target_names: Optional[List[str]] = None, prefix: str = "") -> int:
+
+def replace_linear_with_lora(
+    module: nn.Module,
+    r: int = 4,
+    alpha: Optional[int] = None,
+    dropout: float = 0.0,
+    target_names: Optional[List[str]] = None,
+    prefix: str = "",
+) -> int:
     """
-    Recursively replace nn.Linear in module with LoRALinear when name contains any of target_names substrings.
-    If target_names is None -> replace all nn.Linear.
-    Returns number of replacements.
+    递归地将 module 内部符合条件的 nn.Linear 替换为 LoRALinear.
+    target_names: 只替换名字中包含这些子串的层；None 则替换所有线性层。
     """
     replaced = 0
     for name, child in list(module.named_children()):
@@ -92,16 +93,19 @@ def replace_linear_with_lora(module: nn.Module, r: int = 4, alpha: Optional[int]
                 setattr(module, name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
                 replaced += 1
         else:
-            replaced += replace_linear_with_lora(child, r=r, alpha=alpha, dropout=dropout,
-                                                 target_names=target_names, prefix=full_name)
+            replaced += replace_linear_with_lora(
+                child, r=r, alpha=alpha, dropout=dropout, target_names=target_names, prefix=full_name
+            )
     return replaced
+
 
 def collect_lora_state_dict(root_module: nn.Module, module_key_prefix: str) -> Dict[str, torch.Tensor]:
     """
-    Collect LoRA params (A/B and scaling) from modules and return a dict of tensors ready to save.
-    Keys are prefixed with module_key_prefix to indicate component (e.g., 'unet.', 'text_encoder.')
+    从 root_module 中收集所有 LoRALinear 的参数 (A/B/scaling/r)，
+    返回用于保存的 state_dict。
+    key 以 module_key_prefix 开头，用于区分组件 (text_encoder./unet./controlnet.)
     """
-    out = {}
+    out: Dict[str, torch.Tensor] = {}
     for name, m in root_module.named_modules():
         if isinstance(m, LoRALinear) and getattr(m, "r", 0) > 0:
             keybase = f"{module_key_prefix}{name.replace('.', '_')}"
@@ -111,10 +115,11 @@ def collect_lora_state_dict(root_module: nn.Module, module_key_prefix: str) -> D
             out[f"{keybase}.r"] = torch.tensor(m.r, dtype=torch.int32)
     return out
 
+
 def load_lora_into_module(root_module: nn.Module, state: Dict[str, torch.Tensor], module_key_prefix: str):
     """
-    Load LoRA tensors from state dict into LoRALinear modules of root_module.
-    module_key_prefix must match keys used in collect_lora_state_dict.
+    将 safetensors 中保存的 LoRA 权重加载回 root_module 内部的 LoRALinear.
+    module_key_prefix 必须与保存时一致。
     """
     for name, m in root_module.named_modules():
         if isinstance(m, LoRALinear) and getattr(m, "r", 0) > 0:
@@ -128,26 +133,38 @@ def load_lora_into_module(root_module: nn.Module, state: Dict[str, torch.Tensor]
                 if a.shape == m.lora_A.shape and b.shape == m.lora_B.shape:
                     m.lora_A.data.copy_(a)
                     m.lora_B.data.copy_(b)
-                else:
-                    # shape mismatch: try transpose-compatible or skip
-                    print(f"[WARN] shape mismatch for {keybase}, skipping load")
                 if s_key in state:
                     m.scaling = float(state[s_key].item())
 
-# ---------------------
+
+# =====================
 # Dataset
-# ---------------------
+# =====================
 class PhotoControlDataset(Dataset):
     """
-    Dataset supports:
-      - images_dir: directory with processed photos (512x512)
-      - control_dir (optional): directory with control maps (edges/pose) aligned by filename
-      - captions_file (optional): CSV or JSONL mapping filename->caption
-    If captions_file missing, uses default prompt template or filename stem as caption.
+    - images_dir: data/processed/photos   (预处理人像，如 realperson_000_image.png)
+    - control_dir: data/processed/edges   (真实图线条 realperson_000_edge.png；目录里混有动漫线稿不会被用到)
+    - captions_file: 可选 CSV/JSONL filename->caption；否则用模板或默认 prompt
+
+    返回:
+    {
+        "pixel_values": (3,H,W) 张量, [-1,1]
+        "control_image": (3,H,W) 张量 (无控制图时为全0占位，不返回 None)
+        "input_ids": tokenizer 的 ids
+        "filename": 文件名
+    }
     """
-    def __init__(self, images_dir: str, control_dir: Optional[str] = None, captions_file: Optional[str] = None,
-                 tokenizer: Optional[CLIPTokenizer] = None, resolution: int = 512, prompt_template: Optional[str] = None,
-                 flip_prob: float = 0.0):
+
+    def __init__(
+        self,
+        images_dir: str,
+        control_dir: Optional[str] = None,
+        captions_file: Optional[str] = None,
+        tokenizer: Optional[CLIPTokenizer] = None,
+        resolution: int = 512,
+        prompt_template: Optional[str] = None,
+        flip_prob: float = 0.0,
+    ):
         super().__init__()
         self.images_dir = images_dir
         self.control_dir = control_dir
@@ -156,140 +173,191 @@ class PhotoControlDataset(Dataset):
         self.flip_prob = flip_prob
         self.prompt_template = prompt_template
 
-        # load entries
-        self.samples = []  # list of (image_path, control_path_or_None, caption)
-        captions_map = {}
+        captions_map: Dict[str, str] = {}
         if captions_file and os.path.exists(captions_file):
             if captions_file.endswith(".jsonl") or captions_file.endswith(".json"):
-                with open(captions_file, 'r', encoding='utf-8') as f:
+                with open(captions_file, "r", encoding="utf-8") as f:
                     for line in f:
+                        if not line.strip():
+                            continue
                         obj = json.loads(line)
                         fn = obj.get("filename") or obj.get("file") or obj.get("image")
                         caption = obj.get("caption") or obj.get("text") or ""
                         if fn:
                             captions_map[fn] = caption
             else:
-                # simple CSV: filename,caption
                 import csv
-                with open(captions_file, newline='', encoding='utf-8') as f:
+
+                with open(captions_file, newline="", encoding="utf-8") as f:
                     reader = csv.reader(f)
                     for row in reader:
                         if len(row) >= 2:
                             captions_map[row[0]] = row[1]
 
-        for fn in os.listdir(images_dir):
-            if not fn.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                continue
+        # 只匹配 realperson_xxx_image.png -> realperson_xxx_edge.png；其余边缘图自动忽略
+        self.samples = []
+        image_files = sorted(
+            [fn for fn in os.listdir(images_dir) if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+        )
+
+        for fn in image_files:
             img_path = os.path.join(images_dir, fn)
             control_path = None
+
             if control_dir:
-                candidate = os.path.join(control_dir, fn)
-                if os.path.exists(candidate):
-                    control_path = candidate
-            caption = captions_map.get(fn, None)
+                stem, ext = os.path.splitext(fn)
+                if stem.endswith("_image"):
+                    edge_stem = stem.replace("_image", "_edge")
+                    cand = os.path.join(control_dir, edge_stem + ext)
+                    if os.path.exists(cand):
+                        control_path = cand
+                else:
+                    # 兜底：同名匹配
+                    cand_same = os.path.join(control_dir, fn)
+                    if os.path.exists(cand_same):
+                        control_path = cand_same
+
+            caption = captions_map.get(fn)
             if caption is None:
                 stem = os.path.splitext(fn)[0]
                 if self.prompt_template:
                     caption = self.prompt_template.replace("{filename}", stem)
                 else:
-                    # default generic caption emphasizing profile/photo->anime conversion
-                    caption = "a high quality Chinese traditional anime portrait, intricate hanfu, delicate brush style"
+                    caption = "a high quality anime style portrait, detailed, beautiful lighting"
+
             self.samples.append((img_path, control_path, caption))
 
-        # transforms
-        self.image_transform = transforms.Compose([
-            transforms.Resize((self.resolution, self.resolution)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5,0.5,0.5], [0.5,0.5,0.5])
-        ])
-        self.control_transform = transforms.Compose([
-            transforms.Resize((self.resolution, self.resolution)),
-            transforms.ToTensor(),
-            # control maps typically in [0,1], but diffusers expects [-1,1] latents later; we keep as [0,1]
-        ])
+        self.image_transform = transforms.Compose(
+            [
+                transforms.Resize((self.resolution, self.resolution)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]
+        )
+        self.control_transform = transforms.Compose(
+            [
+                transforms.Resize((self.resolution, self.resolution)),
+                transforms.ToTensor(),  # [0,1]
+            ]
+        )
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         img_path, control_path, caption = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
         if torch.rand(1).item() < self.flip_prob:
             image = transforms.functional.hflip(image)
         pixel_values = self.image_transform(image)
 
-        control_image = None
+        # 永远返回 Tensor，不返回 None（无控制图则返回全0占位）
         if control_path:
             ci = Image.open(control_path).convert("RGB")
             if torch.rand(1).item() < self.flip_prob:
                 ci = transforms.functional.hflip(ci)
             control_image = self.control_transform(ci)
-
-        input_ids = None
-        if self.tokenizer is not None:
-            toks = self.tokenizer(caption, truncation=True, padding="max_length", max_length=self.tokenizer.model_max_length, return_tensors="pt")
-            input_ids = toks.input_ids[0]
         else:
-            input_ids = caption
+            control_image = torch.zeros_like(pixel_values)
 
-        return {"pixel_values": pixel_values, "control_image": control_image, "input_ids": input_ids, "filename": os.path.basename(img_path)}
+        if self.tokenizer is not None:
+            toks = self.tokenizer(
+                caption,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids[0]
+        else:
+            toks = caption
 
-# ---------------------
-# Training core
-# ---------------------
+        return {
+            "pixel_values": pixel_values,
+            "control_image": control_image,
+            "input_ids": toks,
+            "filename": os.path.basename(img_path),
+        }
+
+
+# =====================
+# Training
+# =====================
 def train(args):
-    accelerator = Accelerator(mixed_precision=args.mixed_precision if args.mixed_precision != "no" else None)
-    device = accelerator.device
+    print("Using device:", DEVICE)
 
-    print("Device:", device)
-
-    # Load tokenizer and models
-    print("Loading models...")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=True)
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder").to(device)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae").to(device)
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet").to(device)
+    # 1) 加载 Stable Diffusion 1.x 组件：tokenizer + text_encoder + VAE + UNet
+    print("Loading base models (this may take a while on CPU)...")
+    tokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=True
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder"
+    ).to(DEVICE)
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae"
+    ).to(DEVICE)
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet"
+    ).to(DEVICE)
 
     controlnet = None
     if args.controlnet_model:
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model).to(device)
-        # By default freeze controlnet base params; we optionally inject LoRA into controlnet if requested
+        controlnet = ControlNetModel.from_pretrained(args.controlnet_model).to(DEVICE)
         for p in controlnet.parameters():
             p.requires_grad = False
 
-    # Freeze base model params (we only train LoRA adapters)
-    for p in vae.parameters(): p.requires_grad = False
-    for p in unet.parameters(): p.requires_grad = False
-    for p in text_encoder.parameters(): p.requires_grad = False
+    # 冻结 base 权重
+    for p in vae.parameters():
+        p.requires_grad = False
+    for p in unet.parameters():
+        p.requires_grad = False
+    for p in text_encoder.parameters():
+        p.requires_grad = False
 
-    # Inject LoRA into text_encoder / unet / optional controlnet
+    # 2) 注入 LoRA（UNet + text_encoder；可选 ControlNet）
     print("Injecting LoRA adapters...")
-    te_count = replace_linear_with_lora(text_encoder, r=args.rank, alpha=args.alpha, dropout=args.lora_dropout, target_names=args.te_target_names)
-    unet_count = replace_linear_with_lora(unet, r=args.rank, alpha=args.alpha, dropout=args.lora_dropout, target_names=args.unet_target_names)
+    te_count = replace_linear_with_lora(
+        text_encoder,
+        r=args.rank,
+        alpha=args.alpha,
+        dropout=args.lora_dropout,
+        target_names=args.te_target_names,
+    )
+    unet_count = replace_linear_with_lora(
+        unet,
+        r=args.rank,
+        alpha=args.alpha,
+        dropout=args.lora_dropout,
+        target_names=args.unet_target_names,
+    )
     cn_count = 0
     if controlnet and args.train_controlnet_lora:
-        cn_count = replace_linear_with_lora(controlnet, r=args.rank, alpha=args.alpha, dropout=args.lora_dropout, target_names=args.cn_target_names)
+        cn_count = replace_linear_with_lora(
+            controlnet,
+            r=args.rank,
+            alpha=args.alpha,
+            dropout=args.lora_dropout,
+            target_names=args.cn_target_names,
+        )
+    print(f"LoRA injected: text_encoder={te_count}, unet={unet_count}, controlnet={cn_count}")
 
-    print(f"LoRA injected: text_encoder {te_count}, unet {unet_count}, controlnet {cn_count}")
-
-    # Optionally load existing LoRA safetensors (resume)
+    # 3) resume
     if args.lora_checkpoint and os.path.exists(args.lora_checkpoint):
-        print("Loading LoRA checkpoint:", args.lora_checkpoint)
+        print("Loading existing LoRA checkpoint:", args.lora_checkpoint)
         state = safetensors_load(args.lora_checkpoint)
-        # Expect keys with prefixes: 'text_encoder.', 'unet.', 'controlnet.' as saved by this script
         load_lora_into_module(text_encoder, state, "text_encoder.")
         load_lora_into_module(unet, state, "unet.")
         if controlnet:
             load_lora_into_module(controlnet, state, "controlnet.")
 
-    # Collect LoRA parameters
-    def gather_lora_params(module):
-        ps = []
+    # 4) trainable params = 所有 LoRA A/B
+    def gather_lora_params(module: nn.Module):
+        params = []
         for m in module.modules():
             if isinstance(m, LoRALinear) and getattr(m, "r", 0) > 0:
-                ps.append(m.lora_A)
-                ps.append(m.lora_B)
-        return ps
+                params.append(m.lora_A)
+                params.append(m.lora_B)
+        return params
 
     trainable_params = []
     trainable_params += gather_lora_params(text_encoder)
@@ -298,12 +366,11 @@ def train(args):
         trainable_params += gather_lora_params(controlnet)
 
     if len(trainable_params) == 0:
-        raise RuntimeError("No LoRA parameters found to train. Check injection or target names.")
+        raise RuntimeError("No LoRA parameters found to train. Check injection settings.")
 
-    # Optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    # Dataset / Dataloader
+    # 5) dataset / dataloader
     dataset = PhotoControlDataset(
         images_dir=args.train_data_dir,
         control_dir=args.control_data_dir,
@@ -311,99 +378,127 @@ def train(args):
         tokenizer=tokenizer,
         resolution=args.resolution,
         prompt_template=args.prompt_template,
-        flip_prob=args.flip_prob
+        flip_prob=args.flip_prob,
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=False,
+    )
 
-    # Scheduler for diffusion noise (simple default)
+    # 6) 噪声调度器（SD1 风格）
     if os.path.exists(os.path.join(args.pretrained_model_name_or_path, "scheduler")):
-        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+        noise_scheduler = DDPMScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler"
+        )
     else:
-        noise_scheduler = DDPMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        noise_scheduler = DDPMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+        )
 
-    # Prepare with accelerator
-    text_encoder, unet, optimizer, dataloader = accelerator.prepare(text_encoder, unet, optimizer, dataloader)
-    if controlnet and args.train_controlnet_lora:
-        # ensure controlnet is on device for potential LoRA params (LoRA inside controlnet still requires module on device)
-        controlnet.to(accelerator.device)
-
-    vae.eval()  # VAE not trained
-    noise_scheduler.to(accelerator.device)
-
-    # Training loop
-    global_step = 0
+    vae.eval()
     text_encoder.train()
     unet.train()
     if controlnet and args.train_controlnet_lora:
         controlnet.train()
-    else:
-        if controlnet:
-            controlnet.eval()
+    elif controlnet:
+        controlnet.eval()
 
-    scaler = None  # accelerate handles mixed precision
+    global_step = 0
+    print("Start training (CPU only, will be slow; 建议先用很小的 max_train_steps 做烟雾测试)...")
 
-    print("Starting training...")
     for epoch in range(args.num_train_epochs):
-        loop = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}")
-        for step, batch in loop:
-            pixel_values = batch["pixel_values"].to(accelerator.device)
-            input_ids = batch["input_ids"].to(accelerator.device)
-            control_image = None
-            if batch.get("control_image") is not None:
-                control_image = batch["control_image"].to(accelerator.device)
-            # Encode images to latents
+        loop = tqdm(dataloader, desc=f"Epoch {epoch}", ncols=100)
+        for batch in loop:
+            if global_step >= args.max_train_steps:
+                break
+
+            pixel_values = batch["pixel_values"].to(DEVICE)
+            control_image = batch["control_image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+
+            # encode image -> latents
             with torch.no_grad():
-                latents = vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
+                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
 
             bsz = latents.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-            # noise and noisy latents
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=DEVICE,
+            ).long()
             noise = torch.randn_like(latents)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # text encoder embeddings
-            encoder_outputs = text_encoder(input_ids)
-            encoder_hidden_states = encoder_outputs.last_hidden_state if hasattr(encoder_outputs, "last_hidden_state") else encoder_outputs[0]
+            # 文本编码 (单路，768 维)
+            enc_out = text_encoder(input_ids)
+            encoder_hidden_states = (
+                enc_out.last_hidden_state
+                if hasattr(enc_out, "last_hidden_state")
+                else enc_out[0]
+            )
 
-            # ControlNet forward: produce additional residuals (no grad if frozen)
+            # ControlNet 前向（可选，兼容新旧 diffusers 参数名）
             cn_out = None
-            if controlnet and control_image is not None:
-                # controlnet call signature may vary: try common arg name 'conditioning_image' then fallback 'controlnet_cond'
-                try:
-                    cn_out = controlnet(noisy_latents, timesteps, encoder_hidden_states, conditioning_image=control_image)
-                except TypeError:
-                    try:
-                        cn_out = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=control_image)
-                    except Exception as e:
-                        raise RuntimeError(f"ControlNet forward failed: {e}")
+            down_block_res_samples = None
+            mid_block_res_sample = None
 
-            # UNet forward with optional additional residuals
-            unet_kwargs = {"encoder_hidden_states": encoder_hidden_states}
-            if cn_out is not None:
-                # expected keys: down_block_additional_residuals, mid_block_additional_residual
+            if controlnet is not None:
+                try:
+                    cn_out = controlnet(
+                        sample=latents,
+                        timestep=timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                        controlnet_cond=control_image,  # 老参数名
+                        return_dict=True,
+                    )
+                except TypeError:
+                    cn_out = controlnet(
+                        sample=latents,
+                        timestep=timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                        conditioning_image=control_image,  # 新参数名
+                        return_dict=True,
+                    )
+
+                # 兼容不同版本的输出字段
+                if hasattr(cn_out, "down_block_res_samples"):
+                    down_block_res_samples = cn_out.down_block_res_samples
+                    mid_block_res_sample = cn_out.mid_block_res_sample
                 if hasattr(cn_out, "down_block_additional_residuals"):
-                    unet_kwargs["down_block_additional_residuals"] = cn_out.down_block_additional_residuals
+                    down_block_res_samples = cn_out.down_block_additional_residuals
                 if hasattr(cn_out, "mid_block_additional_residual"):
-                    unet_kwargs["mid_block_additional_residual"] = cn_out.mid_block_additional_residual
+                    mid_block_res_sample = cn_out.mid_block_additional_residual
+
+            # UNet 预测
+            unet_kwargs = {"encoder_hidden_states": encoder_hidden_states}
+            if down_block_res_samples is not None:
+                unet_kwargs["down_block_additional_residuals"] = down_block_res_samples
+            if mid_block_res_sample is not None:
+                unet_kwargs["mid_block_additional_residual"] = mid_block_res_sample
 
             model_pred = unet(noisy_latents, timesteps, **unet_kwargs).sample
 
-            loss = F.mse_loss(model_pred, noise)
-            loss = loss / args.gradient_accumulation_steps
-
-            accelerator.backward(loss)
+            loss = F.mse_loss(model_pred, noise) / args.gradient_accumulation_steps
+            loss.backward()
 
             if (global_step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             if global_step % args.logging_steps == 0:
                 loop.set_postfix({"step": global_step, "loss": float(loss.detach().cpu())})
 
-            # Save checkpoints
+            # 保存 checkpoint
             if global_step % args.save_steps == 0 and global_step > 0:
                 os.makedirs(args.output_dir, exist_ok=True)
-                # collect LoRA states
                 sd = {}
                 sd.update(collect_lora_state_dict(text_encoder, "text_encoder."))
                 sd.update(collect_lora_state_dict(unet, "unet."))
@@ -414,55 +509,127 @@ def train(args):
                 print(f"[INFO] Saved LoRA checkpoint: {ckpt_path}")
 
             global_step += 1
-            if global_step >= args.max_train_steps:
-                break
+
         if global_step >= args.max_train_steps:
             break
 
-    # Final save
+    # 最终保存
     os.makedirs(args.output_dir, exist_ok=True)
-    sd = {}
-    sd.update(collect_lora_state_dict(text_encoder, "text_encoder."))
-    sd.update(collect_lora_state_dict(unet, "unet."))
+    final_state = {}
+    final_state.update(collect_lora_state_dict(text_encoder, "text_encoder."))
+    final_state.update(collect_lora_state_dict(unet, "unet."))
     if controlnet:
-        sd.update(collect_lora_state_dict(controlnet, "controlnet."))
-    final_path = os.path.join(args.output_dir, f"lora_final.safetensors")
-    safetensors_save(sd, final_path)
-    print(f"[DONE] Training finished. Saved final LoRA: {final_path}")
+        final_state.update(collect_lora_state_dict(controlnet, "controlnet."))
+    final_path = os.path.join(args.output_dir, "lora_final.safetensors")
+    safetensors_save(final_state, final_path)
+    print(f"[DONE] Training finished. Saved final LoRA to: {final_path}")
 
-# ---------------------
+
+# =====================
 # CLI
-# ---------------------
+# =====================
 def get_args():
-    parser = argparse.ArgumentParser(description="Train LoRA for Animagine-XL + ControlNet")
-    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Base Animagine-XL model dir or HF id")
-    parser.add_argument("--controlnet_model", type=str, default=None, help="ControlNet model dir or HF id (optional)")
-    parser.add_argument("--train_data_dir", type=str, required=True, help="path to processed photos directory (data/processed/photos)")
-    parser.add_argument("--control_data_dir", type=str, default=None, help="path to processed control maps (data/processed/edges)")
-    parser.add_argument("--captions_file", type=str, default=None, help="optional captions CSV/JSONL mapping filename->caption")
-    parser.add_argument("--output_dir", type=str, default="./lora_out", help="output dir for safetensors")
-    parser.add_argument("--lora_checkpoint", type=str, default=None, help="optional existing safetensors to load (resume)")
+    parser = argparse.ArgumentParser(
+        description="CPU-only LoRA training for Stable Diffusion 1.x + optional ControlNet"
+    )
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        required=True,
+        help="SD1.x 基础模型目录或 HF repo id，如 runwayml/stable-diffusion-v1-5",
+    )
+    parser.add_argument(
+        "--controlnet_model",
+        type=str,
+        default=None,
+        help="ControlNet 模型目录或 HF repo id (可选，如 lllyasviel/sd-controlnet-canny)",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        required=True,
+        help="人像图片目录，如 data/processed/photos",
+    )
+    parser.add_argument(
+        "--control_data_dir",
+        type=str,
+        default=None,
+        help="控制图像目录(边缘/线稿)，如 data/processed/edges",
+    )
+    parser.add_argument(
+        "--captions_file",
+        type=str,
+        default=None,
+        help="可选 captions CSV/JSONL (filename, caption)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./lora_out",
+        help="输出目录，用于保存 safetensors 权重",
+    )
+    parser.add_argument(
+        "--lora_checkpoint",
+        type=str,
+        default=None,
+        help="可选已有 LoRA safetensors，resume 使用",
+    )
+
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument("--max_train_steps", type=int, default=1000)
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=100,
+        help="CPU 很慢，建议初版先设为几十~几百步",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--rank", type=int, default=4, help="LoRA rank")
-    parser.add_argument("--alpha", type=int, default=None, help="LoRA alpha scaling")
+    parser.add_argument("--alpha", type=int, default=None, help="LoRA alpha 缩放")
     parser.add_argument("--lora_dropout", type=float, default=0.0)
-    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader worker 数；Windows+CPU 建议为 0",
+    )
     parser.add_argument("--flip_prob", type=float, default=0.0)
-    parser.add_argument("--prompt_template", type=str, default=None, help="optional prompt template for samples without captions")
-    parser.add_argument("--train_controlnet_lora", action="store_true", help="also inject and train LoRA in ControlNet")
-    parser.add_argument("--te_target_names", nargs="*", default=["q_proj", "k_proj", "v_proj", "out_proj", "proj"], help="text encoder replacement name substrings")
-    parser.add_argument("--unet_target_names", nargs="*", default=["to_q", "to_k", "to_v", "to_out", "proj_out", "proj_in"], help="unet replacement name substrings")
-    parser.add_argument("--cn_target_names", nargs="*", default=["to_q", "to_k", "to_v", "to_out", "proj"], help="controlnet replacement name substrings")
+    parser.add_argument(
+        "--prompt_template",
+        type=str,
+        default=None,
+        help="没有 caption 时的提示模板，例如 'an anime portrait of {filename}'",
+    )
+    parser.add_argument(
+        "--train_controlnet_lora",
+        action="store_true",
+        help="是否给 ControlNet 也注入并训练 LoRA",
+    )
+    parser.add_argument(
+        "--te_target_names",
+        nargs="*",
+        default=["q_proj", "k_proj", "v_proj", "out_proj", "proj"],
+        help="text encoder 中要替换的 Linear 名称子串",
+    )
+    parser.add_argument(
+        "--unet_target_names",
+        nargs="*",
+        default=["to_q", "to_k", "to_v", "to_out", "proj_out", "proj_in"],
+        help="UNet 中要替换的 Linear 名称子串",
+    )
+    parser.add_argument(
+        "--cn_target_names",
+        nargs="*",
+        default=["to_q", "to_k", "to_v", "to_out", "proj"],
+        help="ControlNet 中要替换的 Linear 名称子串",
+    )
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = get_args()
