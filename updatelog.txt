@@ -1,0 +1,39 @@
+这段代码是一个 Stable Diffusion XL 图生图（img2img）脚本，其功能包括：
+
+支持 SDXL 图生图（img2img）：
+
+使用 StableDiffusionXLImg2ImgPipeline，基于 Animagine XL 4.0 进行图像生成。
+
+支持 SDXL 控制器（ControlNet）：
+
+支持多种 ControlNet 模型（例如：canny, depth, openpose 等），可以保留输入图像的结构特征。
+
+通过 StableDiffusionXLControlNetImg2ImgPipeline 加载 ControlNet 模型来优化图像生成。
+
+自动调整输入图像大小：
+
+自动缩放输入图像，以避免显存溢出（OOM）问题，支持 8GB 显卡和更大显存的 GPU。
+
+使用自动显存检测，根据 GPU 显存选择最大输入图像尺寸。
+
+LoRA 权重支持：
+
+支持 LoRA（Low-Rank Adaptation），可加载多个 LoRA 权重文件。
+
+显存优化：
+
+启用 xformers 内存优化来减少显存占用。
+
+启用 VAE slicing 和 attention slicing，进一步优化显存使用。
+
+日志自动记录：
+
+所有 [INFO]、[WARN]、[OK] 的日志会自动写入 logs/generate.log 文件，并在终端显示。
+
+自动创建 logs/ 目录来存储日志文件。
+
+支持自定义参数：
+
+输入图像路径、输出路径、模型路径、Prompt、负面 Prompt、strength、steps 等都可自定义。
+
+参数支持包括生成图像的分辨率、guidance_scale、strength 等。
