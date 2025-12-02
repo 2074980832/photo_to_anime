@@ -9,3 +9,7 @@ logs/
 *.ckpt
 *.safetensors
 .env
+lora/
+generate_input_photos/
+generate_output_photos/
+hub/

@@ -15,4 +15,4 @@ scikit-image
 gradio
 
 xformers
-"controlnet-aux==0.0.7"
+controlnet-aux
