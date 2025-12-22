@@ -11,6 +11,22 @@ Features:
  - robust error handling / logging
 Minimal required deps: diffusers, transformers, torch, safetensors, pillow
 Optional: controlnet_aux (用于自动生成 control image，若没有会退化到仅 image->img2img)
+运行示例：python scripts/generate.py \
+  --model ./hub/models--runwayml--stable-diffusion-v1-5 \
+  --controlnets lllyasviel/sd-controlnet-canny \
+  --lora ./lora/lora_final.safetensors \
+  --lora-weights 1.0 \
+  --apply-lora-to-controlnet \
+  --prompt "portrait of a girl" \
+  --device cuda
+
+或更高精度的：python scripts/generate.py \
+  --model ./hub/models--runwayml--stable-diffusion-v1-5 \
+  --controlnets lllyasviel/sd-controlnet-canny \
+  --lora ./lora/lora_final.safetensors --lora-weights 1.0 \
+  --apply-lora-to-controlnet \
+  --prompt "chinese traditional style anime, hanfu, ink-wash painting elements, ultra detailed face, finely detailed eyes and eyelashes, crisp lineart, intricate hair strands, masterpiece, extremely detailed" \
+  --device cuda --width 768 --height 1024 --steps 50 --guidance 9.0 --strength 0.5
 """
 
 from pathlib import Path
