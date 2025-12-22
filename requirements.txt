@@ -13,6 +13,5 @@ peft
 bitsandbytes
 scikit-image
 gradio
-
 xformers
 controlnet-aux

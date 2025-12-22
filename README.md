@@ -2,7 +2,7 @@
 
 ## 🎯 项目目标
 将现实人物照片转换为具有**国风特色（Chinese traditional / Hanfu-like）**的动漫风格图像（Photo → Anime Style Transfer）。
-技术栈：Stable Diffusion (Animagine-XL) + ControlNet（结构/姿态约束）+ LoRA（轻量风格微调）。目标是在保留人物内容（轮廓、姿态、五官）前提下，让生成结果呈现明显且稳定的国风动漫视觉特征。
+技术栈：Stable Diffusion  + ControlNet（结构/姿态约束）+ LoRA（轻量风格微调）。目标是在保留人物内容（轮廓、姿态、五官）前提下，让生成结果呈现明显且稳定的国风动漫视觉特征。
 
 ---
 
@@ -53,7 +53,7 @@ Stable Diffusion + ControlNet/LoRA 推理
 ### 🔹 技术要点
 | 模块 | 方法 / 工具 | 功能 |
 |------|---------------|------|
-| 基础模型 | Animagine-XL-4.0（Stable Diffusion 系列） | 生成动漫风格图像 |
+| 基础模型 | Stable Diffusion | 生成动漫风格图像 |
 | 结构保持 | ControlNet | 保持姿态、轮廓、构图一致 |
 | 风格微调 | LoRA | 增强特定动漫风格特征 |
 | 推理接口 | Diffusers Pipeline + Torch | 实现本地加载与批量生成 |

@@ -1,39 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SD1 img2img 生成脚本（与 train_lora.py 的 LoRA 格式兼容）
-增强点：
- - 支持标准 diffusers repo（model_index.json）和 hub snapshots 布局
- - 手动构造 pipeline 时补全 scheduler 与 feature_extractor（避免缺参数错误）
- - 中文注释、single/multiple 模式、可选 --lora、不强制 --output
-保存为 scripts/generate.py，从项目根运行示例：
-  python scripts/generate.py --model ./hub/models--runwayml--stable-diffusion-v1-5
+generate.py - focusing on model-group innovations (LoRA merging + robust injection)
+Features:
+ - 支持多个 LoRA safetensors 合并（按 --lora-weights 指定权重线性混合）
+ - 更鲁棒的 LoRA 键匹配策略（兼容常见导出命名差异）
+ - 可将 LoRA 注入到 UNet / text encoder / optional ControlNet
+ - 常见推理优化：自动 dtype、attention slicing、xformers（若可用）、autocast 推理
+ - 兼容 diffusers snapshot 布局与 standard from_pretrained
+ - robust error handling / logging
+Minimal required deps: diffusers, transformers, torch, safetensors, pillow
+Optional: controlnet_aux (用于自动生成 control image，若没有会退化到仅 image->img2img)
 """
+
 from pathlib import Path
 import argparse
 import logging
 import os
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any, Tuple
 
 import torch
 import torch.nn as nn
 from PIL import Image
-
-# diffusers / transformers 组件
-from diffusers import (
-    StableDiffusionImg2ImgPipeline,
-    StableDiffusionControlNetImg2ImgPipeline,
-    ControlNetModel,
-    AutoencoderKL,
-    UNet2DConditionModel,
-    DDPMScheduler,
-)
-from transformers import CLIPTokenizer, CLIPTextModel, CLIPFeatureExtractor
 from safetensors.torch import load_file as safetensors_load
 
-# ---------------- LoRA helper（与 train_lora.py 保持一致） ----------------
+# diffusers / transformers
+try:
+    from diffusers import (
+        StableDiffusionImg2ImgPipeline,
+        StableDiffusionControlNetImg2ImgPipeline,
+        ControlNetModel,
+        AutoencoderKL,
+        UNet2DConditionModel,
+        DDPMScheduler,
+    )
+    from transformers import CLIPTokenizer, CLIPTextModel, CLIPFeatureExtractor
+    DIFFUSERS_AVAILABLE = True
+except Exception:
+    DIFFUSERS_AVAILABLE = False
+
+# optional controlnet_aux detectors (not required)
+try:
+    from controlnet_aux import CannyDetector, MidasDetector, OpenposeDetector, LineartDetector, PidiNetDetector, NormalBaeDetector
+    _CNET_AUX_AVAILABLE = True
+except Exception:
+    _CNET_AUX_AVAILABLE = False
+
+# ---------------- LoRA 占位层 ----------------
 class LoRALinear(nn.Module):
-    """把原始 nn.Linear 包装成 LoRA 占位层（与训练脚本一致）"""
+    """LoRA 占位层包装 nn.Linear"""
     def __init__(self, orig: nn.Linear, r: int = 4, alpha: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
         self.orig = orig
@@ -45,7 +60,6 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
         if self.r > 0:
-            # 确保 LoRA 参数创建在与 orig 相同的 device（避免后续运算的 device mismatch）
             try:
                 orig_device = next(orig.parameters()).device
             except StopIteration:
@@ -58,7 +72,6 @@ class LoRALinear(nn.Module):
             self.register_parameter("lora_A", None)
             self.register_parameter("lora_B", None)
 
-        # 冻结原始层参数
         for p in self.orig.parameters():
             p.requires_grad = False
 
@@ -70,7 +83,6 @@ class LoRALinear(nn.Module):
             out = out + lora_out * self.scaling
         return out
 
-
 def replace_linear_with_lora(
     module: nn.Module,
     r: int = 4,
@@ -79,9 +91,7 @@ def replace_linear_with_lora(
     target_names: Optional[List[str]] = None,
     prefix: str = "",
 ) -> int:
-    """
-    递归替换 module 中匹配的 nn.Linear 为 LoRALinear（返回替换数量）。
-    """
+    """递归替换 nn.Linear -> LoRALinear, 返回替换数量"""
     replaced = 0
     for name, child in list(module.named_children()):
         full_name = f"{prefix}.{name}" if prefix else name
@@ -96,42 +106,9 @@ def replace_linear_with_lora(
             )
     return replaced
 
-
-def load_lora_into_module(root_module: nn.Module, state: Dict[str, torch.Tensor], module_key_prefix: str):
-    """
-    将 safetensors 中保存的 LoRA 权重加载回 LoRALinear。
-    module_key_prefix: "text_encoder." / "unet." / "controlnet."
-    """
-    for name, m in root_module.named_modules():
-        if isinstance(m, LoRALinear) and getattr(m, "r", 0) > 0:
-            keybase = f"{module_key_prefix}{name.replace('.', '_')}"
-            a_key = f"{keybase}.lora_A"
-            b_key = f"{keybase}.lora_B"
-            s_key = f"{keybase}.scaling"
-            if a_key in state and b_key in state:
-                a = state[a_key]
-                b = state[b_key]
-                try:
-                    a = a.to(m.lora_A.device)
-                    b = b.to(m.lora_B.device)
-                    if a.shape == m.lora_A.shape and b.shape == m.lora_B.shape:
-                        m.lora_A.data.copy_(a)
-                        m.lora_B.data.copy_(b)
-                    else:
-                        logging.warning(f"LoRA shape mismatch for {keybase}: saved {a.shape}/{b.shape}, model {m.lora_A.shape}/{m.lora_B.shape}")
-                except Exception as e:
-                    logging.warning(f"Failed to load LoRA {keybase}: {e}")
-            if s_key in state:
-                try:
-                    m.scaling = float(state[s_key].item())
-                except Exception:
-                    pass
-
-
-# ---------------- 辅助工具 ----------------
+# ---------------- utils ----------------
 def detect_default_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
-
 
 def detect_max_input_size(device: str):
     if device == "cpu" or not torch.cuda.is_available():
@@ -144,37 +121,48 @@ def detect_max_input_size(device: str):
     else:
         return 1024
 
-
 def resize_input_image(img: Image.Image, max_size: int):
-    """按最大边长等比缩放输入图，避免 OOM"""
     w, h = img.size
     max_dim = max(w, h)
     if max_dim <= max_size:
         return img
     scale = max_size / max_dim
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+    new_w = max(8, int(w * scale))
+    new_h = max(8, int(h * scale))
     return img.resize((new_w, new_h), Image.LANCZOS)
-
 
 def list_image_files_in_dir(dirpath: Path) -> List[Path]:
     if not dirpath.exists() or not dirpath.is_dir():
         return []
     return sorted([p for p in dirpath.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]])
 
+# ---------------- controlnet_aux detectors 封装（可选） ----------------
+def build_cnet_detector(cnet_type: str):
+    if not _CNET_AUX_AVAILABLE:
+        return None
+    t = cnet_type.lower()
+    if t == "canny":
+        return CannyDetector()
+    if t in ("depth", "midas"):
+        return MidasDetector()
+    if t in ("openpose", "pose"):
+        return OpenposeDetector()
+    if t in ("lineart", "hed", "softedge"):
+        return LineartDetector()
+    if t == "pidi":
+        return PidiNetDetector()
+    if t in ("normal", "normalbae"):
+        return NormalBaeDetector()
+    return None
 
-# ---------------- pipeline loader（增强：自动查找 snapshots 并补全 scheduler/feature_extractor） ----------------
+# ---------------- snapshot-friendly pipeline loader ----------------
 def find_latest_snapshot_dir(base: Path) -> Optional[Path]:
-    """
-    在 base 下寻找 snapshots/<hash>/ 的最新子目录，兼容 hub/.../snapshots/<hash> 布局。
-    """
     snaps_root = base / "snapshots"
     if snaps_root.exists() and snaps_root.is_dir():
         subs = [d for d in snaps_root.iterdir() if d.is_dir()]
         if subs:
             subs_sorted = sorted(subs, key=lambda p: p.name)
             return subs_sorted[-1]
-    # 递归查找更深层次的 snapshots（容错）
     for p in base.rglob("snapshots"):
         parent = Path(p)
         subs = [d for d in parent.iterdir() if d.is_dir()]
@@ -183,36 +171,28 @@ def find_latest_snapshot_dir(base: Path) -> Optional[Path]:
             return subs_sorted[-1]
     return None
 
+def load_sd1_pipeline_from_path(model_path: Path, controlnet_models: Optional[List[Any]], dtype: torch.dtype):
+    if not DIFFUSERS_AVAILABLE:
+        raise RuntimeError("缺少 diffusers/transformers 库，无法加载 pipeline。请安装 diffusers 与 transformers。")
 
-def load_sd1_pipeline_from_path(model_path: Path, controlnet: Optional[ControlNetModel], dtype: torch.dtype):
-    """
-    支持：
-     - 标准 diffusers repo（有 model_index.json / pipeline_config.json）：直接 from_pretrained
-     - snapshot 布局（会自动查找 latest snapshot）：逐组件加载，并且**补全 scheduler 与 feature_extractor**
-    """
-    # 优先用 from_pretrained 处理标准仓库布局
     if (model_path / "model_index.json").exists() or (model_path / "pipeline_config.json").exists():
-        if controlnet:
-            return StableDiffusionControlNetImg2ImgPipeline.from_pretrained(str(model_path), controlnet=controlnet, torch_dtype=dtype, safety_checker=None)
+        if controlnet_models:
+            return StableDiffusionControlNetImg2ImgPipeline.from_pretrained(str(model_path), controlnet=controlnet_models, torch_dtype=dtype, safety_checker=None)
         else:
             return StableDiffusionImg2ImgPipeline.from_pretrained(str(model_path), torch_dtype=dtype, safety_checker=None)
 
-    # 尝试查找 snapshot 目录（hub/.../snapshots/<hash>）
     snapshot = find_latest_snapshot_dir(model_path)
-    # 如果用户直接指定了 snapshot（model_path 本身就是 snapshot），也支持
     if snapshot is None and (model_path / "text_encoder").exists():
         snapshot = model_path
 
     if snapshot is None:
         raise RuntimeError(f"Model directory {model_path} 没有 model_index.json，也找不到 snapshots 下的快照。请传入标准 diffusers 目录或 snapshot。")
 
-    # 期望 snapshot 下存在 text_encoder, tokenizer, unet, vae 等子目录
     te_dir = snapshot / "text_encoder"
     tokenizer_dir = snapshot / "tokenizer"
     unet_dir = snapshot / "unet"
     vae_dir = snapshot / "vae"
 
-    # 一些 snapshot 可能命名为 tokenizer_2 等，做容错
     if not tokenizer_dir.exists():
         if (snapshot / "tokenizer_2").exists():
             tokenizer_dir = snapshot / "tokenizer_2"
@@ -222,13 +202,11 @@ def load_sd1_pipeline_from_path(model_path: Path, controlnet: Optional[ControlNe
     if not (te_dir.exists() and tokenizer_dir.exists() and unet_dir.exists() and vae_dir.exists()):
         raise RuntimeError(f"Snapshot 目录 {snapshot} 缺少必要子目录（text_encoder / tokenizer / unet / vae），无法构造 SD1 pipeline。")
 
-    # 逐组件加载：tokenizer, text_encoder, vae, unet
     tokenizer = CLIPTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
     text_encoder = CLIPTextModel.from_pretrained(str(te_dir))
     vae = AutoencoderKL.from_pretrained(str(vae_dir))
     unet = UNet2DConditionModel.from_pretrained(str(unet_dir))
 
-    # 重要：构造一个合适的 scheduler（用于推理），若 snapshot 中没有 scheduler，则使用 SD1 常用 DDPMScheduler 默认参数
     scheduler = DDPMScheduler(
         beta_start=0.00085,
         beta_end=0.012,
@@ -236,22 +214,18 @@ def load_sd1_pipeline_from_path(model_path: Path, controlnet: Optional[ControlNe
         num_train_timesteps=1000,
     )
 
-    # 重要：构造 feature_extractor（pipeline 需要）。优先尝试从 transformers hub 下载常见 CLIP extractor；
-    # 若下载失败（离线环境），退回到直接实例化 CLIPFeatureExtractor()（可用但可能不含预处理参数）
     try:
         feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
-    except Exception as e:
-        logging.warning(f"无法从网络加载 CLIPFeatureExtractor（{e}），将使用默认实例回退。")
+    except Exception:
         feature_extractor = CLIPFeatureExtractor()
 
-    # 构造 pipeline（将我们手动加载的组件传入）
-    if controlnet:
+    if controlnet_models:
         pipe = StableDiffusionControlNetImg2ImgPipeline(
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             unet=unet,
-            controlnet=controlnet,
+            controlnet=controlnet_models,
             scheduler=scheduler,
             safety_checker=None,
             feature_extractor=feature_extractor,
@@ -268,49 +242,215 @@ def load_sd1_pipeline_from_path(model_path: Path, controlnet: Optional[ControlNe
         )
     return pipe
 
+# ---------------- safetensors load & merge ----------------
+def load_safetensors_state(path: str) -> Dict[str, torch.Tensor]:
+    st = safetensors_load(path)
+    # copy to cpu to avoid device mismatch later
+    return {k: v.detach().cpu().clone() for k, v in st.items()}
 
-# ---------------- 主流程（不变，省略重复注释） ----------------
+def merge_lora_states(paths: List[str], weights: Optional[List[float]] = None) -> Dict[str, torch.Tensor]:
+    """
+    线性合并多个 safetensors state（权重归一化）
+    """
+    if not paths:
+        return {}
+    states = [load_safetensors_state(p) for p in paths]
+    n = len(states)
+    if weights is None:
+        weights = [1.0 / n] * n
+    else:
+        # pad or cut
+        if len(weights) < n:
+            weights = weights + [weights[-1]] * (n - len(weights))
+        elif len(weights) > n:
+            weights = weights[:n]
+        s = sum(weights)
+        if s == 0:
+            weights = [1.0 / n] * n
+        else:
+            weights = [w / s for w in weights]
+
+    merged: Dict[str, torch.Tensor] = {}
+    all_keys = set().union(*[set(s.keys()) for s in states])
+    for k in all_keys:
+        accum = None
+        target_shape = None
+        ok = True
+        for idx, st in enumerate(states):
+            v = st.get(k, None)
+            if v is None:
+                continue
+            if target_shape is None:
+                target_shape = tuple(v.shape)
+            elif tuple(v.shape) != target_shape:
+                ok = False
+                break
+            val = v.to(torch.float32) * float(weights[idx])
+            accum = val if accum is None else (accum + val)
+        if ok and accum is not None:
+            merged[k] = accum
+    return merged
+
+# ---------------- LoRA key matching & load into module ----------------
+def candidate_key_variants(prefix: str, name: str) -> List[str]:
+    # produce candidate key base names for searching
+    variants = []
+    nx = name.replace('.', '_')
+    variants.append(f"{prefix}{nx}")
+    variants.append(f"{prefix}{name}")
+    variants.append(f"{prefix}{name.replace('.', '')}")
+    variants.append(f"{prefix}{nx}".lower())
+    variants.append(f"{prefix}{name}".lower())
+    return variants
+
+def find_lora_keys_for_name(state: Dict[str, torch.Tensor], module_key_prefix: str, name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    寻找 lora_A / lora_B / scaling 的键，返回 (a_key, b_key, s_key) 或 (None,...)
+    采取宽松匹配策略：下划线/点/大小写等
+    """
+    # common patterns
+    candidates = []
+    for base in candidate_key_variants(module_key_prefix, name):
+        candidates.append(f"{base}.lora_A")
+        candidates.append(f"{base}.lora_A.weight")
+        candidates.append(f"{base}.lora_A.weight")
+        candidates.append(f"{base}.lora_B")
+        candidates.append(f"{base}.lora_B.weight")
+        candidates.append(f"{base}_lora_A")
+        candidates.append(f"{base}_lora_B")
+
+    a_key = None
+    b_key = None
+    s_key = None
+
+    # direct scan: look for keys that endwith lora_a / lora_b and contain name snippet
+    name_snip = name.replace('.', '_').lower()
+    for k in state.keys():
+        kl = k.lower()
+        if ('lora_a' in kl or kl.endswith('lora_a') or kl.endswith('lora_a.weight')) and (name_snip in kl or module_key_prefix.replace('.', '').lower() in kl):
+            a_key = k
+            break
+    if a_key:
+        # try to derive b_key
+        b_try = a_key.replace('lora_a', 'lora_b')
+        if b_try in state:
+            b_key = b_try
+        else:
+            # find any similar prefix
+            pref = a_key.rsplit('lora_a', 1)[0]
+            for kk in state.keys():
+                if kk.startswith(pref) and ('lora_b' in kk.lower() or kk.lower().endswith('lora_b') or kk.lower().endswith('lora_b.weight')):
+                    b_key = kk
+                    break
+
+    # fallback: check candidates
+    if not a_key:
+        for cand in candidates:
+            if cand in state:
+                a_key = cand
+                break
+    if a_key and not b_key:
+        b_try = a_key.replace('lora_A', 'lora_B')
+        if b_try in state:
+            b_key = b_try
+
+    # scaling candidate
+    for sname in [f"{module_key_prefix}{name.replace('.', '_')}.scaling", f"{module_key_prefix}{name}.scaling", f"{module_key_prefix}{name.replace('.', '')}.scaling"]:
+        if sname in state:
+            s_key = sname
+            break
+    if not s_key:
+        for k in state.keys():
+            if 'scaling' in k.lower() and name_snip in k.lower():
+                s_key = k
+                break
+
+    return a_key, b_key, s_key
+
+def load_lora_into_module(root_module: nn.Module, state: Dict[str, torch.Tensor], module_key_prefix: str, device: torch.device):
+    """
+    把合并后的 state 注入到 root_module 的 LoRALinear 占位层
+    module_key_prefix e.g. "text_encoder." / "unet." / "controlnet."
+    """
+    for name, m in root_module.named_modules():
+        if isinstance(m, LoRALinear) and getattr(m, "r", 0) > 0:
+            a_key, b_key, s_key = find_lora_keys_for_name(state, module_key_prefix, name)
+            if a_key and b_key and a_key in state and b_key in state:
+                a = state[a_key]
+                b = state[b_key]
+                try:
+                    # ensure shapes match
+                    if tuple(a.shape) == tuple(m.lora_A.shape) and tuple(b.shape) == tuple(m.lora_B.shape):
+                        m.lora_A.data.copy_(a.to(device=device, dtype=m.lora_A.dtype))
+                        m.lora_B.data.copy_(b.to(device=device, dtype=m.lora_B.dtype))
+                        logging.info(f"Loaded LoRA into module {name} (keys: {a_key}, {b_key})")
+                    else:
+                        logging.debug(f"Shape mismatch for module {name}: model expects {m.lora_A.shape}/{m.lora_B.shape}, got {a.shape}/{b.shape}")
+                except Exception as e:
+                    logging.warning(f"Failed to load LoRA into {name}: {e}")
+            else:
+                logging.debug(f"No matching LoRA keys for module {name} with prefix {module_key_prefix}")
+
+            # scaling
+            if s_key and s_key in state:
+                try:
+                    val = float(state[s_key].item())
+                    m.scaling = val
+                except Exception:
+                    pass
+
+# ---------------- main ----------------
 def main():
-    parser = argparse.ArgumentParser(description="SD1 img2img generate script (single/multiple) - fixed scheduler/fe")
-    parser.add_argument("--model", type=str, required=True, help="SD1 模型目录或 HF repo id（支持 snapshot 风格）")
-    parser.add_argument("--controlnet", type=str, default=None, help="可选 ControlNet 模型目录/ID（SD1 兼容）")
-    parser.add_argument("--mode", type=str, choices=["single", "multiple"], default="single", help="single (单张) 或 multiple (批量)")
-    parser.add_argument("--input", type=str, default=None, help="输入文件或目录（覆盖默认输入目录）")
-    parser.add_argument("--control-input", type=str, default=None, help="单张 control 图（single 模式或作为所有图的统一 control）")
-    parser.add_argument("--control-dir", type=str, default=None, help="control 图目录（multiple 模式下按同名或索引匹配）")
-    parser.add_argument("--output", type=str, default=None, help="输出目录（可选，缺省使用 generate_output_photos/<mode>）")
-    parser.add_argument("--prompt", type=str, default="anime style, masterpiece, high quality, detailed")
+    parser = argparse.ArgumentParser(description="SD1 img2img generate - focused on LoRA merging & injection")
+    parser.add_argument("--model", type=str, required=True, help="SD1 模型目录或 HF repo id（支持 snapshot 布局）")
+    parser.add_argument("--controlnets", nargs="*", default=None, help="可选 ControlNet 模型目录/ID（可传多个）")
+    parser.add_argument("--mode", type=str, choices=["single", "multiple"], default="single")
+    parser.add_argument("--input", type=str, default=None)
+    parser.add_argument("--control-input", type=str, default=None)
+    parser.add_argument("--control-dir", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--prompt", type=str, default="portrait of a girl")
     parser.add_argument("--negative", type=str, default="lowres, bad anatomy, blurry")
-    parser.add_argument("--lora", type=str, nargs="+", default=None, help="可选 LoRA safetensors 路径（可传多个）")
+    parser.add_argument("--lora", type=str, nargs="+", default=None, help="多个 LoRA safetensors 路径")
+    parser.add_argument("--lora-weights", nargs="*", type=float, default=None, help="与 --lora 对应的权重")
+    parser.add_argument("--save-merged-lora", type=str, default=None, help="若指定则保存合并后的 safetensors")
+    parser.add_argument("--apply-lora-to-controlnet", action="store_true", help="是否把 LoRA 注入 ControlNet（可选）")
     parser.add_argument("--strength", type=float, default=0.6)
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--guidance", type=float, default=7.5)
     parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-input-size", type=int, default=None)
-    parser.add_argument("--rank", type=int, default=4, help="注入 LoRA 时使用的 rank（与训练时一致）")
+    parser.add_argument("--rank", type=int, default=4)
     parser.add_argument("--unet-target-names", nargs="*", default=["to_q", "to_k", "to_v", "to_out", "proj_out", "proj_in"])
     parser.add_argument("--te-target-names", nargs="*", default=["q_proj", "k_proj", "v_proj", "out_proj", "proj"])
-    parser.add_argument("--num-images", type=int, default=None, help="如果输入是目录，可限制最多处理多少张")
-    parser.add_argument("--cnet-type", type=str, default=None, help="若要自动生成 control 图（需要 controlnet_aux）: canny/depth/openpose/lineart/softedge/normal")
+    parser.add_argument("--num-images", type=int, default=None)
+    parser.add_argument("--device-dtype", choices=["auto", "fp16", "fp32"], default="auto")
     args = parser.parse_args()
 
-    # 日志
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     log = logging.getLogger(__name__)
 
-    # 使用当前工作目录作为 repo root（便于在 repo 根运行 scripts/generate.py）
     repo_root = Path.cwd()
-    log.info(f"运行目录（repo root）: {repo_root}")
+    log.info(f"Repo root: {repo_root}")
 
-    device = args.device if args.device else detect_default_device()
-    log.info(f"使用设备: {device}")
+    device_str = args.device if args.device else detect_default_device()
+    device = torch.device(device_str)
+    log.info(f"Using device: {device}")
 
-    max_input_size = args.max_input_size if args.max_input_size else detect_max_input_size(device)
-    log.info(f"最大输入边长（用于 resize）: {max_input_size}")
+    # dtype selection
+    if args.device_dtype == "fp16":
+        dtype = torch.float16
+    elif args.device_dtype == "fp32":
+        dtype = torch.float32
+    else:
+        dtype = torch.float16 if device_str == "cuda" else torch.float32
 
-    # 默认输入/输出目录（相对于 repo_root）
+    max_input_size = args.max_input_size if args.max_input_size else detect_max_input_size(device_str)
+    log.info(f"max_input_size = {max_input_size}")
+
+    # input selection
     if args.mode == "single":
         default_input_dir = repo_root / "generate_input_photos" / "single"
         default_output_dir = repo_root / "generate_output_photos" / "single"
@@ -318,35 +458,27 @@ def main():
         default_input_dir = repo_root / "generate_input_photos" / "multiple"
         default_output_dir = repo_root / "generate_output_photos" / "multiple"
 
-    # 准备输入图片列表（支持未提供 input 的默认目录）
     images: List[Path] = []
     if args.input:
-        in_path = Path(args.input)
-        if in_path.is_file():
-            images = [in_path]
-        elif in_path.is_dir():
-            files = list_image_files_in_dir(in_path)
-            if args.mode == "single":
-                if not files:
-                    raise RuntimeError(f"输入目录 {in_path} 没有图片。")
-                images = [files[0]]
-            else:
-                images = files
+        p = Path(args.input)
+        if p.is_file():
+            images = [p]
+        elif p.is_dir():
+            imgs = list_image_files_in_dir(p)
+            if not imgs:
+                raise RuntimeError(f"输入目录 {p} 没有图片。")
+            images = [imgs[0]] if args.mode == "single" else imgs
         else:
-            raise RuntimeError(f"输入路径 {in_path} 不存在。")
+            raise RuntimeError(f"输入路径 {p} 不存在。")
     else:
-        files = list_image_files_in_dir(default_input_dir)
-        if not files:
+        imgs = list_image_files_in_dir(default_input_dir)
+        if not imgs:
             raise RuntimeError(f"缺省输入目录 {default_input_dir} 没有图片，请传入 --input。")
-        if args.mode == "single":
-            images = [files[0]]
-        else:
-            images = files
+        images = [imgs[0]] if args.mode == "single" else imgs
 
     if args.num_images:
         images = images[: args.num_images]
 
-    # control 图处理（single/multiple 情况）
     control_single_path: Optional[Path] = None
     control_dir: Optional[Path] = None
     if args.control_input:
@@ -360,29 +492,57 @@ def main():
             log.warning(f"control-dir {control_dir} 不存在或不是目录，忽略。")
             control_dir = None
 
-    # 加载 ControlNet 模型（若指定）
-    controlnet_model = None
-    if args.controlnet:
-        log.info(f"加载 ControlNet: {args.controlnet}")
-        controlnet_model = ControlNetModel.from_pretrained(args.controlnet, torch_dtype=torch.float16 if device == "cuda" else torch.float32)
+    # load controlnets if any
+    controlnet_models: List[Any] = []
+    if args.controlnets:
+        if not DIFFUSERS_AVAILABLE:
+            log.error("指定了 controlnets，但 diffusers 未安装或不可用。")
+        else:
+            for c in args.controlnets:
+                try:
+                    cn = ControlNetModel.from_pretrained(c, torch_dtype=(torch.float16 if device_str == 'cuda' else torch.float32))
+                    controlnet_models.append(cn)
+                    log.info(f"Loaded ControlNet: {c}")
+                except Exception as e:
+                    log.warning(f"Failed to load ControlNet {c}: {e}")
 
-    # ---------- 加载 pipeline（增强兼容性） ----------
-    log.info("正在加载 SD1 pipeline（可能需要一点时间）...")
+    # detectors
+    cnet_types: List[str] = []
+    if args.controlnets:
+        for c in args.controlnets:
+            lc = c.lower()
+            if 'canny' in lc:
+                cnet_types.append('canny')
+            elif 'openpose' in lc or 'pose' in lc:
+                cnet_types.append('openpose')
+            elif 'hed' in lc or 'lineart' in lc:
+                cnet_types.append('lineart')
+            elif 'depth' in lc or 'midas' in lc:
+                cnet_types.append('depth')
+            else:
+                cnet_types.append('canny')
+    detectors: List[Optional[Any]] = []
+    for t in cnet_types:
+        d = build_cnet_detector(t)
+        detectors.append(d)
+        if d is None:
+            log.warning(f"Detector {t} unavailable (controlnet_aux not installed)")
+
+    # load pipeline
+    log.info("Loading SD pipeline ... (this may take time)")
     model_path = Path(args.model)
-    dtype = torch.float16 if device == "cuda" else torch.float32
-
     try:
-        pipe = load_sd1_pipeline_from_path(model_path, controlnet_model, dtype)
+        pipe = load_sd1_pipeline_from_path(model_path, controlnet_models if controlnet_models else None, dtype)
     except Exception as e:
-        log.error(f"从 {model_path} 构造 pipeline 失败：{e}")
+        log.error(f"Failed to construct pipeline from {model_path}: {e}")
         raise
 
-    # 优化（xformers / slicing）并移动到设备
+    # enable optimizations
     try:
         pipe.enable_xformers_memory_efficient_attention()
-        log.info("已启用 xformers（若可用）")
+        log.info("xformers enabled (if available)")
     except Exception:
-        log.debug("xformers 未安装或不可用")
+        log.debug("xformers not available")
     try:
         pipe.enable_attention_slicing()
     except Exception:
@@ -391,79 +551,61 @@ def main():
         pipe.enable_vae_slicing()
     except Exception:
         pass
-
+    
+    # move to device
     pipe.to(device)
 
-    # 注入 LoRA 占位（以便后面加载权重时能找到 LoRALinear）
-    log.info("注入 LoRA 占位层（UNet / text encoder / 可选 ControlNet）...")
+    # inject LoRA placeholders
+    log.info("Injecting LoRA placeholders into text_encoder and unet (and controlnet if present)")
     te_count = replace_linear_with_lora(pipe.text_encoder, r=args.rank, target_names=args.te_target_names)
     unet_count = replace_linear_with_lora(pipe.unet, r=args.rank, target_names=args.unet_target_names)
     cn_count = 0
-    if controlnet_model and hasattr(pipe, "controlnet"):
-        cn_count = replace_linear_with_lora(pipe.controlnet, r=args.rank, target_names=args.unet_target_names)
-    log.info(f"已注入 LoRA 占位: text_encoder={te_count}, unet={unet_count}, controlnet={cn_count}")
+    if controlnet_models:
+        for cn in controlnet_models:
+            cn_count += replace_linear_with_lora(cn, r=args.rank, target_names=args.unet_target_names)
+    log.info(f"Replaced Linear -> LoRA placeholders: text_encoder={te_count}, unet={unet_count}, controlnet_total={cn_count}")
 
-    # 加载 LoRA 权重（可选）
+    # load and merge LoRA weights if provided
+    merged_state: Dict[str, torch.Tensor] = {}
     if args.lora:
-        merged_state: Dict[str, torch.Tensor] = {}
-        for lpath in args.lora:
-            if not os.path.exists(lpath):
-                log.warning(f"LoRA 文件 {lpath} 不存在，跳过。")
-                continue
-            log.info(f"读取 LoRA safetensors: {lpath}")
-            st = safetensors_load(lpath)
-            merged_state.update(st)
-        if merged_state:
-            load_lora_into_module(pipe.text_encoder, merged_state, "text_encoder.")
-            load_lora_into_module(pipe.unet, merged_state, "unet.")
-            if controlnet_model and hasattr(pipe, "controlnet"):
-                load_lora_into_module(pipe.controlnet, merged_state, "controlnet.")
-            log.info("已加载 LoRA 权重（匹配的键已应用）")
+        lora_paths = list(args.lora)
+        weights = None
+        if args.lora_weights and len(args.lora_weights) > 0:
+            weights = list(args.lora_weights)
+        log.info(f"Loading and merging {len(lora_paths)} LoRA files (weights={weights})")
+        merged_state = merge_lora_states(lora_paths, weights)
+        if not merged_state:
+            log.warning("Merged LoRA state is empty (可能是因为不同文件键不兼容或形状不一致)")
         else:
-            log.info("未找到有效 LoRA 权重，继续不使用 LoRA。")
+            if args.save_merged_lora:
+                try:
+                    from safetensors.torch import save_file as safetensors_save
+                    cpu_state = {k: v.detach().cpu().clone() for k, v in merged_state.items()}
+                    safetensors_save(cpu_state, args.save_merged_lora)
+                    log.info(f"Saved merged LoRA to {args.save_merged_lora}")
+                except Exception as e:
+                    log.warning(f"Failed to save merged safetensors: {e}")
 
-    # 可选：controlnet_aux 自动生成 control 图
-    cnet_detector = None
-    if args.cnet_type:
-        try:
-            from controlnet_aux import CannyDetector, MidasDetector, OpenposeDetector, LineartDetector, PidiNetDetector, NormalBaeDetector
-            ct = args.cnet_type.lower()
-            if ct == "canny":
-                cnet_detector = CannyDetector()
-            elif ct == "depth":
-                cnet_detector = MidasDetector()
-            elif ct == "openpose":
-                cnet_detector = OpenposeDetector()
-            elif ct == "lineart":
-                cnet_detector = LineartDetector()
-            elif ct == "softedge":
-                cnet_detector = PidiNetDetector()
-            elif ct == "normal":
-                cnet_detector = NormalBaeDetector()
-            else:
-                log.warning(f"未知 cnet-type: {args.cnet_type}，跳过自动预处理。")
-                cnet_detector = None
-            if cnet_detector:
-                log.info(f"使用 controlnet_aux 的检测器: {args.cnet_type}")
-        except Exception:
-            log.warning("controlnet_aux 未安装或导入失败，自动 control 预处理不可用。")
-            cnet_detector = None
+            # inject into modules
+            load_lora_into_module(pipe.text_encoder, merged_state, "text_encoder.", device)
+            load_lora_into_module(pipe.unet, merged_state, "unet.", device)
+            if args.apply_lora_to_controlnet and controlnet_models:
+                for cn in controlnet_models:
+                    load_lora_into_module(cn, merged_state, "controlnet.", device)
+            log.info("LoRA weights applied where matched")
 
-    # 输出目录
-    if args.output:
-        out_dir = Path(args.output)
-    else:
-        out_dir = repo_root / "generate_output_photos" / args.mode
+    # prepare output dir
+    out_dir = Path(args.output) if args.output else (repo_root / "generate_output_photos" / args.mode)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 辅助：按同名或按索引查找 control 图（multiple 模式）
+    # helper to find control image per input (if control_dir provided)
     def find_control_for_image(img_path: Path, idx: int, control_dir: Optional[Path], control_common: Optional[Path]) -> Optional[Image.Image]:
         if control_common:
             try:
                 ci = Image.open(control_common).convert("RGB")
                 return resize_input_image(ci, max_input_size)
             except Exception as e:
-                log.warning(f"打开 control common {control_common} 失败: {e}")
+                log.warning(f"Open control common failed: {e}")
                 return None
         if control_dir:
             cand = control_dir / img_path.name
@@ -472,73 +614,132 @@ def main():
                     ci = Image.open(cand).convert("RGB")
                     return resize_input_image(ci, max_input_size)
                 except Exception as e:
-                    log.warning(f"打开 control 图 {cand} 失败: {e}")
+                    log.warning(f"Open control {cand} failed: {e}")
             files = list_image_files_in_dir(control_dir)
             if idx < len(files):
                 try:
                     ci = Image.open(files[idx]).convert("RGB")
                     return resize_input_image(ci, max_input_size)
                 except Exception as e:
-                    log.warning(f"打开 control 图 {files[idx]} 失败: {e}")
+                    log.warning(f"Open control {files[idx]} failed: {e}")
         return None
 
-    # 逐张生成
+    # main generation loop
     counter = 1
     for i, img_path in enumerate(images):
-        log.info(f"处理: {img_path}")
+        log.info(f"Processing {img_path}")
         img = Image.open(img_path).convert("RGB")
         img = resize_input_image(img, max_input_size)
 
-        control_image = None
+        # prepare control images for each controlnet
+        control_images_for_this_img: List[Optional[Image.Image]] = []
         if control_single_path:
             try:
                 ci = Image.open(control_single_path).convert("RGB")
-                control_image = resize_input_image(ci, max_input_size)
+                ci = resize_input_image(ci, max_input_size)
             except Exception as e:
-                log.warning(f"打开 control-input {control_single_path} 失败: {e}")
-                control_image = None
+                log.warning(f"Open control-input failed: {e}")
+                ci = None
+            for _ in controlnet_models:
+                control_images_for_this_img.append(ci)
         elif control_dir:
-            control_image = find_control_for_image(img_path, i, control_dir, None)
-        elif cnet_detector is not None:
-            try:
-                control_image = cnet_detector(img)
-            except Exception as e:
-                log.warning(f"controlnet_aux detector 运行失败: {e}; 本张不使用 control 图。")
-                control_image = None
-
-        log.info("运行 pipeline ...")
-        if hasattr(pipe, "controlnet") and control_image is not None:
-            result = pipe(
-                prompt=args.prompt,
-                negative_prompt=args.negative,
-                image=img,
-                control_image=control_image,
-                strength=args.strength,
-                num_inference_steps=args.steps,
-                guidance_scale=args.guidance,
-                width=args.width,
-                height=args.height,
-            )
+            for _ in controlnet_models:
+                ci = find_control_for_image(img_path, i, control_dir, None)
+                control_images_for_this_img.append(ci)
         else:
-            result = pipe(
-                prompt=args.prompt,
-                negative_prompt=args.negative,
-                image=img,
-                strength=args.strength,
-                num_inference_steps=args.steps,
-                guidance_scale=args.guidance,
-                width=args.width,
-                height=args.height,
-            )
+            # auto generate with detectors if available
+            for det in detectors:
+                if det is None:
+                    control_images_for_this_img.append(None)
+                    continue
+                try:
+                    ci = det(img)
+                    if isinstance(ci, list):
+                        ci = ci[0]
+                    if not isinstance(ci, Image.Image):
+                        import numpy as np
+                        ci = Image.fromarray(ci)
+                    ci = resize_input_image(ci.convert("RGB"), max_input_size)
+                except Exception as e:
+                    log.warning(f"detector run failed: {e}")
+                    ci = None
+                control_images_for_this_img.append(ci)
+
+        use_control = bool(controlnet_models and any(x is not None for x in control_images_for_this_img))
+
+        # set control scales
+        cond_scales: List[float] = []
+        if args.controlnets:
+            # default 0.8 for each
+            cond_scales = [0.8] * len(controlnet_models)
+        # generation call with autocast for fp16 on cuda
+        try:
+            if device_str == "cuda" and dtype == torch.float16:
+                with torch.cuda.amp.autocast():
+                    if use_control:
+                        result = pipe(
+                            prompt=args.prompt,
+                            negative_prompt=args.negative,
+                            image=img,
+                            control_image=control_images_for_this_img,
+                            strength=args.strength,
+                            num_inference_steps=args.steps,
+                            guidance_scale=args.guidance,
+                            controlnet_conditioning_scale=cond_scales,
+                            width=args.width,
+                            height=args.height,
+                        )
+                    else:
+                        result = pipe(
+                            prompt=args.prompt,
+                            negative_prompt=args.negative,
+                            image=img,
+                            strength=args.strength,
+                            num_inference_steps=args.steps,
+                            guidance_scale=args.guidance,
+                            width=args.width,
+                            height=args.height,
+                        )
+            else:
+                if use_control:
+                    result = pipe(
+                        prompt=args.prompt,
+                        negative_prompt=args.negative,
+                        image=img,
+                        control_image=control_images_for_this_img,
+                        strength=args.strength,
+                        num_inference_steps=args.steps,
+                        guidance_scale=args.guidance,
+                        controlnet_conditioning_scale=cond_scales,
+                        width=args.width,
+                        height=args.height,
+                    )
+                else:
+                    result = pipe(
+                        prompt=args.prompt,
+                        negative_prompt=args.negative,
+                        image=img,
+                        strength=args.strength,
+                        num_inference_steps=args.steps,
+                        guidance_scale=args.guidance,
+                        width=args.width,
+                        height=args.height,
+                    )
+        except Exception as e:
+            log.error(f"Pipeline failed on image {img_path}: {e}")
+            continue
 
         out_img = result.images[0]
         out_path = out_dir / f"{img_path.stem}_result_{counter}.png"
-        out_img.save(out_path)
-        log.info(f"已保存: {out_path}")
+        try:
+            out_img.save(out_path)
+            log.info(f"Saved {out_path}")
+        except Exception as e:
+            log.warning(f"Save failed: {e}")
+
         counter += 1
 
-    log.info("全部完成。")
-
+    log.info("All done.")
 
 if __name__ == "__main__":
     main()
