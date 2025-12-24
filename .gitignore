@@ -13,3 +13,5 @@ lora/
 generate_input_photos/
 generate_output_photos/
 hub/
+temp_web_inputs/
+temp_web_outputs/

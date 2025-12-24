@@ -4,124 +4,183 @@ import os
 from pathlib import Path
 import shutil
 from PIL import Image
-import time
 
-# --- 配置 ---
-GENERATE_SCRIPT = "generate.py"  # 指向你的脚本路径
-TEMP_INPUT_DIR = "temp_web_inputs"
-TEMP_OUTPUT_DIR = "temp_web_outputs"
+# ================= 路径配置 =================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# 确保临时目录存在
-os.makedirs(TEMP_INPUT_DIR, exist_ok=True)
-os.makedirs(TEMP_OUTPUT_DIR, exist_ok=True)
+GENERATE_SCRIPT = PROJECT_ROOT / "scripts" / "generate.py"
+TEMP_INPUT_DIR = PROJECT_ROOT / "temp_web_inputs"
+TEMP_OUTPUT_DIR = PROJECT_ROOT / "temp_web_outputs"
 
-st.set_page_config(page_title="SD LoRA Generator UI", layout="wide")
+TEMP_INPUT_DIR.mkdir(exist_ok=True)
+TEMP_OUTPUT_DIR.mkdir(exist_ok=True)
 
-# --- 侧边栏：模型配置 ---
+# ================= 页面配置 =================
+st.set_page_config(
+    page_title="Stable Diffusion LoRA UI",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ================= Sidebar =================
 with st.sidebar:
     st.header("⚙️ 模型设置")
-    
+
     base_model = st.text_input(
-        "Base Model Path / ID", 
-        value="./hub/models--runwayml--stable-diffusion-v1-5",
-        help="指向 diffusers 格式的模型目录或 HuggingFace ID"
-    )
-    
-    device = st.selectbox("Device", ["cuda", "cpu", "mps"], index=0)
-    
-    st.markdown("---")
-    st.subheader("LoRA 配置")
-    
-    # 动态 LoRA 输入
-    lora_paths_input = st.text_area(
-        "LoRA Paths (每行一个)", 
-        value="./lora/lora_final.safetensors",
-        help="输入 .safetensors 文件的路径"
-    )
-    
-    lora_weights_input = st.text_input(
-        "LoRA Weights (空格分隔)", 
-        value="1.0",
-        help="对应上面的 LoRA，例如: 0.8 0.5"
-    )
-    
-    apply_lora_cnet = st.checkbox("Apply LoRA to ControlNet", value=True)
-    
-    st.markdown("---")
-    st.subheader("ControlNet 配置")
-    controlnet_paths = st.text_area(
-        "ControlNet Paths (每行一个)", 
-        value="lllyasviel/sd-controlnet-canny",
-        help="HuggingFace ID 或本地路径"
+        "Base Model",
+        value=str(PROJECT_ROOT / "hub" / "models--runwayml--stable-diffusion-v1-5")
     )
 
-# --- 主界面 ---
-st.title("🎨 Stable Diffusion Generator")
+    device = st.selectbox("Device", ["cuda", "cpu", "mps"], index=0)
+
+    sampler = st.selectbox(
+        "Sampler",
+        ["default", "ddim", "euler", "euler_a", "dpmsolver"],
+        index=4
+    )
+
+    use_autoprompt = st.checkbox(
+        "启用 AutoPrompt",
+        value=False,
+        help="启用后由模型自动生成提示词"
+    )
+
+    st.markdown("---")
+    st.subheader("🧩 LoRA 设置")
+
+    lora_paths_input = st.text_area(
+        "LoRA 文件路径（每行一个）",
+        value=str(PROJECT_ROOT / "lora" / "lora_final.safetensors"),
+        height=80
+    )
+
+    # 解析 LoRA 列表
+    lora_paths = [x.strip() for x in lora_paths_input.splitlines() if x.strip()]
+
+    st.markdown("**LoRA 权重（线性融合）**")
+
+    lora_weights = []
+
+    if len(lora_paths) == 0:
+        st.info("未指定 LoRA，将使用基础模型推理")
+
+    elif len(lora_paths) == 1:
+        # 单 LoRA：简单滑条
+        w = st.slider(
+            f"Weight: {Path(lora_paths[0]).name}",
+            min_value=0.0,
+            max_value=1.5,
+            value=1.0,
+            step=0.05
+        )
+        lora_weights = [w]
+
+    else:
+        # 多 LoRA：逐个权重滑条（真实线性融合）
+        for i, lp in enumerate(lora_paths):
+            w = st.slider(
+                f"[{i}] {Path(lp).name}",
+                min_value=0.0,
+                max_value=1.5,
+                value=1.0,
+                step=0.05
+            )
+            lora_weights.append(w)
+
+    apply_lora_cnet = st.checkbox(
+        "Apply LoRA to ControlNet",
+        value=True
+    )
+
+    st.markdown("---")
+    st.subheader("🕸 ControlNet")
+
+    controlnet_paths_input = st.text_area(
+        "ControlNet（每行一个）",
+        value="lllyasviel/sd-controlnet-canny",
+        height=60
+    )
+
+    controlnet_paths = [
+        x.strip() for x in controlnet_paths_input.splitlines() if x.strip()
+    ]
+
+# ================= 主界面 =================
+st.title("🎨 Stable Diffusion · LoRA Generator")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("1. 图片输入 & 提示词")
-    
-    uploaded_file = st.file_uploader("上传原图 (img2img)", type=["png", "jpg", "jpeg", "webp"])
-    
-    control_image_file = st.file_uploader("上传 ControlNet 参考图 (可选)", type=["png", "jpg", "jpeg", "webp"], help="如果不传，默认使用原图")
+    st.subheader("🖼 输入与提示词")
 
-    prompt = st.text_area("Positive Prompt", height=100, value="portrait of a girl, masterpiece, best quality")
-    negative_prompt = st.text_area("Negative Prompt", height=80, value="lowres, bad anatomy, blurry, worst quality")
+    uploaded_file = st.file_uploader(
+        "上传原图（img2img）",
+        type=["png", "jpg", "jpeg", "webp"]
+    )
 
-    with st.expander("高级参数设置 (Steps, CFG, Size)", expanded=True):
+    control_image_file = st.file_uploader(
+        "ControlNet 参考图（可选）",
+        type=["png", "jpg", "jpeg", "webp"]
+    )
+
+    prompt = st.text_area(
+        "Positive Prompt",
+        value="chinese traditional style anime, hanfu, ink-wash painting elements, ultra detailed face, finely detailed eyes and eyelashes, crisp lineart, intricate hair strands, masterpiece, extremely detailed",
+        height=90,
+        disabled=use_autoprompt
+    )
+
+    negative_prompt = st.text_area(
+        "Negative Prompt",
+        value="低分辨率, 模糊, 透视错误, 畸形手, 畸形眼睛, 错位, 粗糙, 像素化, 现代服饰, 现实风格, 不协调背景",
+        height=70
+    )
+
+    with st.expander("🔧 高级参数", expanded=True):
         c1, c2 = st.columns(2)
-        width = c1.number_input("Width", value=512, step=64)
-        height = c2.number_input("Height", value=768, step=64)
-        
-        steps = c1.slider("Steps", 10, 100, 28)
-        guidance = c2.slider("Guidance Scale", 1.0, 20.0, 7.5)
-        strength = st.slider("Denoising Strength", 0.0, 1.0, 0.6, help="重绘幅度，越大变化越大")
+        width = c1.number_input("Width", 512, step=64)
+        height = c2.number_input("Height", 768, step=64)
 
-    generate_btn = st.button("🚀 生成图片", type="primary", use_container_width=True)
+        steps = c1.slider("Steps", 10, 80, 28)
+        guidance = c2.slider("CFG", 1.0, 20.0, 7.5)
+        strength = st.slider("Denoise Strength", 0.0, 1.0, 0.6)
 
-# --- 生成逻辑 ---
+    generate_btn = st.button("🚀 Generate", use_container_width=True)
+
+# ================= 生成逻辑 =================
 with col2:
-    st.subheader("2. 生成结果")
-    
-    result_placeholder = st.empty()
-    logs_placeholder = st.empty()
+    st.subheader("🧪 生成结果")
+
+    result_box = st.empty()
+    log_box = st.empty()
 
     if generate_btn:
         if not uploaded_file:
-            st.error("❌ 请先上传一张图片！")
+            st.error("请先上传图片")
         else:
-            # 1. 保存上传的图片到临时目录
-            input_path = Path(TEMP_INPUT_DIR) / uploaded_file.name
+            # 保存输入图像
+            input_path = TEMP_INPUT_DIR / uploaded_file.name
             with open(input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
-            
-            # 处理 Control Image
+
+            # ControlNet 输入
             control_arg = []
             if control_image_file:
-                c_path = Path(TEMP_INPUT_DIR) / f"control_{control_image_file.name}"
-                with open(c_path, "wb") as f:
+                cpath = TEMP_INPUT_DIR / f"control_{control_image_file.name}"
+                with open(cpath, "wb") as f:
                     f.write(control_image_file.getbuffer())
-                control_arg = ["--control-input", str(c_path)]
+                control_arg = ["--control-input", str(cpath)]
 
-            # 2. 清理旧的输出
-            if os.path.exists(TEMP_OUTPUT_DIR):
-                shutil.rmtree(TEMP_OUTPUT_DIR)
-            os.makedirs(TEMP_OUTPUT_DIR, exist_ok=True)
+            # 清理输出目录
+            shutil.rmtree(TEMP_OUTPUT_DIR, ignore_errors=True)
+            TEMP_OUTPUT_DIR.mkdir(exist_ok=True)
 
-            # 3. 构建命令行参数
-            # 解析多行输入
-            lora_list = [l.strip() for l in lora_paths_input.split('\n') if l.strip()]
-            cnet_list = [c.strip() for c in controlnet_paths.split('\n') if c.strip()]
-            weights_list = lora_weights_input.strip().split()
-
+            # 构建命令
             cmd = [
-                "python", GENERATE_SCRIPT,
+                "python", str(GENERATE_SCRIPT),
                 "--model", base_model,
                 "--input", str(input_path),
-                "--output", TEMP_OUTPUT_DIR,
-                "--prompt", prompt,
+                "--output", str(TEMP_OUTPUT_DIR),
                 "--negative", negative_prompt,
                 "--device", device,
                 "--width", str(width),
@@ -129,66 +188,55 @@ with col2:
                 "--steps", str(steps),
                 "--guidance", str(guidance),
                 "--strength", str(strength),
-                "--mode", "single" # 强制单图模式
+                "--mode", "single"
             ]
 
-            if lora_list:
-                cmd.append("--lora")
-                cmd.extend(lora_list)
-            
-            if weights_list:
-                cmd.append("--lora-weights")
-                cmd.extend(weights_list)
+            if not use_autoprompt:
+                cmd += ["--prompt", prompt]
+            else:
+                cmd.append("--auto-prompt")
 
-            if cnet_list:
-                cmd.append("--controlnets")
-                cmd.extend(cnet_list)
+            if sampler != "default":
+                cmd += ["--sampler", sampler]
+
+            if lora_paths:
+                cmd += ["--lora", *lora_paths]
+                cmd += ["--lora-weights", *[str(w) for w in lora_weights]]
+
+            if controlnet_paths:
+                cmd += ["--controlnets", *controlnet_paths]
 
             if apply_lora_cnet:
                 cmd.append("--apply-lora-to-controlnet")
-            
-            cmd.extend(control_arg)
 
-            # 4. 执行命令并流式显示日志
-            result_placeholder.info("正在初始化模型并生成...")
-            
+            cmd += control_arg
+
+            result_box.info("⏳ 正在生成，请稍候...")
             process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True, 
-                bufsize=1, 
-                universal_newlines=True
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
             )
-            
-            logs = ""
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                if output:
-                    logs += output
-                    # 简单显示最后几行日志
-                    logs_placeholder.code("\n".join(logs.split('\n')[-5:]), language="bash")
-            
-            rc = process.poll()
-            
-            if rc == 0:
-                # 5. 寻找并展示生成的图片
-                generated_images = list(Path(TEMP_OUTPUT_DIR).glob("*.png"))
-                if generated_images:
-                    # 找到最新的图片
-                    latest_img = max(generated_images, key=os.path.getctime)
-                    image = Image.open(latest_img)
-                    result_placeholder.image(image, caption="生成结果", use_container_width=True)
-                    st.success(f"生成成功！耗时: {logs.split('it/s')[-1] if 'it/s' in logs else 'N/A'}")
-                else:
-                    result_placeholder.error("脚本运行成功，但未找到输出图片。")
-            else:
-                result_placeholder.error("生成失败，请检查参数或日志。")
-                with st.expander("查看完整错误日志"):
-                    st.text(logs)
 
-# --- 页脚说明 ---
+            logs = ""
+            for line in process.stdout:
+                logs += line
+                log_box.code("\n".join(logs.splitlines()[-6:]))
+
+            if process.wait() == 0:
+                images = list(TEMP_OUTPUT_DIR.glob("*.png"))
+                if images:
+                    img = Image.open(max(images, key=os.path.getmtime))
+                    result_box.image(img, use_container_width=True)
+                else:
+                    result_box.error("未找到输出图片")
+            else:
+                result_box.error("生成失败")
+                st.text(logs)
+
+# ================= Footer =================
 st.markdown("---")
-st.markdown("*此界面是 generate.py 的前端封装，确保所有路径（模型、LoRA）相对于脚本运行位置是正确的。*")
+st.caption(
+    "支持多 LoRA 线性融合（权重滑条）、可选 AutoPrompt 与 Sampler。"
+)

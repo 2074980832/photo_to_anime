@@ -11,16 +11,24 @@ Features:
  - robust error handling / logging
 Minimal required deps: diffusers, transformers, torch, safetensors, pillow
 Optional: controlnet_aux (用于自动生成 control image，若没有会退化到仅 image->img2img)
-新增（本次修改）：
- - --auto-prompt 自动生成提示词（优先 BLIP，回退到启发式），并与用户 prompt 融合
- - --prompt-fusion-mode 定义自动提示与用户 prompt 的融合策略（concat/prepend/append/replace）
- - --sampler 多采样器/调度器选择（ddim/pndm/lms/euler/euler_ancestral/dpmsolver/ddpm）
-运行示例：
-python scripts/generate.py \
+运行示例：python scripts/generate.py \
   --model ./hub/models--runwayml--stable-diffusion-v1-5 \
-  --auto-prompt --prompt "chinese traditional style anime, hanfu, ink-wash painting elements, ultra detailed face, finely detailed eyes and eyelashes, crisp lineart, intricate hair strands, masterpiece, extremely detailed" --prompt-fusion-mode concat \
-  --sampler dpmsolver --device cuda
+  --controlnets lllyasviel/sd-controlnet-canny \
+  --lora ./lora/lora_final.safetensors \
+  --lora-weights 1.0 \
+  --apply-lora-to-controlnet \
+  --prompt "portrait of a girl" \
+  --device cuda
+
+或更高精度的：python scripts/generate.py \
+  --model ./hub/models--runwayml--stable-diffusion-v1-5 \
+  --controlnets lllyasviel/sd-controlnet-canny \
+  --lora ./lora/lora_final.safetensors --lora-weights 1.0 \
+  --apply-lora-to-controlnet \
+  --prompt "chinese traditional style anime, hanfu, ink-wash painting elements, ultra detailed face, finely detailed eyes and eyelashes, crisp lineart, intricate hair strands, masterpiece, extremely detailed" \
+  --device cuda --width 768 --height 1024 --steps 50 --guidance 9.0 --strength 0.5
 """
+
 from pathlib import Path
 import argparse
 import logging
@@ -47,33 +55,12 @@ try:
 except Exception:
     DIFFUSERS_AVAILABLE = False
 
-# 额外尝试导入多个 scheduler，用于 --sampler 切换（若不可用则回退）
-try:
-    from diffusers import (
-        DDIMScheduler,
-        PNDMScheduler,
-        LMSDiscreteScheduler,
-        EulerDiscreteScheduler,
-        EulerAncestralDiscreteScheduler,
-        DPMSolverMultistepScheduler,
-    )
-    SCHEDULERS_AVAILABLE = True
-except Exception:
-    SCHEDULERS_AVAILABLE = False
-
 # optional controlnet_aux detectors (not required)
 try:
     from controlnet_aux import CannyDetector, MidasDetector, OpenposeDetector, LineartDetector, PidiNetDetector, NormalBaeDetector
     _CNET_AUX_AVAILABLE = True
 except Exception:
     _CNET_AUX_AVAILABLE = False
-
-# optional BLIP（用于自动生成提示词）
-try:
-    from transformers import BlipProcessor, BlipForConditionalGeneration
-    BLIP_AVAILABLE = True
-except Exception:
-    BLIP_AVAILABLE = False
 
 # ---------------- LoRA 占位层 ----------------
 class LoRALinear(nn.Module):
@@ -428,122 +415,9 @@ def load_lora_into_module(root_module: nn.Module, state: Dict[str, torch.Tensor]
                 except Exception:
                     pass
 
-# ---------------- auto-prompt（BLIP 或 简易启发式回退） ----------------
-def generate_caption_with_blip(img: Image.Image, device: torch.device, max_length: int = 30) -> Optional[str]:
-    """
-    使用 BLIP（transformers）生成图像描述，若不可用返回 None。
-    """
-    if not BLIP_AVAILABLE:
-        return None
-    try:
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
-        inputs = processor(images=img, return_tensors="pt").to(device)
-        out = model.generate(**inputs, max_length=max_length, num_beams=3)
-        caption = processor.decode(out[0], skip_special_tokens=True)
-        return caption
-    except Exception as e:
-        logging.warning(f"BLIP caption 生成失败: {e}")
-        return None
-
-"""
-    轻量回退策略：返回图片的纵横比 + 主色调描述（更快、无需额外依赖）
-"""
-def simple_image_heuristic_caption(img: Image.Image) -> str:
-    w, h = img.size
-    aspect = "portrait" if h >= w else "landscape"
-    # 取缩小图统计主色
-    small = img.resize((64, 64)).convert("RGBA")
-    arr = None
-    try:
-        import numpy as np
-        arr = np.array(small)
-    except Exception:
-        return f"{aspect} photo"
-    pixels = arr.reshape(-1, 4)
-    pixels = pixels[pixels[:, 3] > 200][:, :3]
-    if len(pixels) == 0:
-        main_color = "neutral"
-    else:
-        mean_color = pixels.mean(axis=0)
-        r, g, b = mean_color
-        if r > g and r > b:
-            main_color = "warm-toned"
-        elif g > r and g > b:
-            main_color = "greenish"
-        elif b > r and b > g:
-            main_color = "cool-toned"
-        else:
-            main_color = "neutral"
-    return f"{aspect}, {main_color} photo"
-
-def auto_prompt_for_image(img: Image.Image, device: torch.device, user_prompt: Optional[str], fusion_mode: str = "concat", style_hint: Optional[str] = None) -> str:
-    """
-    生成自动提示词并根据 fusion_mode 与用户 prompt 融合。
-    fusion_mode: concat / prepend / append / replace
-    style_hint: 可传入 "chinese" 等风格提示，脚本未在本次改动中强制使用但可供前端指定
-    """
-    caption = None
-    if BLIP_AVAILABLE:
-        caption = generate_caption_with_blip(img, device)
-    if not caption:
-        caption = simple_image_heuristic_caption(img)
-    # 风格 hint（若传入）
-    style_template = ""
-    if style_hint == "chinese":
-        style_template = "Chinese style, traditional, ink-wash, fine lineart"
-    merged = ""
-    if user_prompt:
-        if fusion_mode == "replace":
-            merged = caption
-        elif fusion_mode == "prepend":
-            merged = f"{caption}, {user_prompt}"
-        elif fusion_mode == "append":
-            merged = f"{user_prompt}, {caption}"
-        else:
-            # concat
-            merged = f"{user_prompt}, {caption}"
-    else:
-        merged = caption
-    if style_template:
-        merged = merged + ", " + style_template
-    # 清洗多余空格
-    merged = ", ".join([s.strip() for s in merged.split(",") if s.strip()])
-    return merged
-
-# ---------------- sampler / scheduler 切换 ----------------
-def set_scheduler_for_pipe(pipe, sampler_name: str):
-    """
-    根据 sampler_name 设置 pipe.scheduler（若 diffusers 提供对应 scheduler）。
-    支持名字: ddim, pndm, lms, euler, euler_ancestral, dpmsolver, ddpm（默认）
-    """
-    name = (sampler_name or "ddpm").lower()
-    if not SCHEDULERS_AVAILABLE:
-        logging.warning("SCHEDULERS 模块不可用，保留默认 scheduler。")
-        return
-    try:
-        if name == "ddim":
-            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-        elif name in ("pndm", "pndmscheduler", "pndm_scheduler"):
-            pipe.scheduler = PNDMScheduler.from_config(pipe.scheduler.config)
-        elif name in ("lms", "lmsd", "lmsdiscrete"):
-            pipe.scheduler = LMSDiscreteScheduler.from_config(pipe.scheduler.config)
-        elif name == "euler":
-            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        elif name in ("euler_ancestral", "euler-ancestral"):
-            pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-        elif name in ("dpmsolver", "dpmsolver_multistep"):
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-        else:
-            # keep default (DDPMScheduler)
-            pass
-        logging.info(f"Scheduler set to {pipe.scheduler.__class__.__name__}")
-    except Exception as e:
-        logging.warning(f"切换 scheduler 失败：{e}")
-
 # ---------------- main ----------------
 def main():
-    parser = argparse.ArgumentParser(description="SD1 img2img generate - focused on LoRA merging & robust injection")
+    parser = argparse.ArgumentParser(description="SD1 img2img generate - focused on LoRA merging & injection")
     parser.add_argument("--model", type=str, required=True, help="SD1 模型目录或 HF repo id（支持 snapshot 布局）")
     parser.add_argument("--controlnets", nargs="*", default=None, help="可选 ControlNet 模型目录/ID（可传多个）")
     parser.add_argument("--mode", type=str, choices=["single", "multiple"], default="single")
@@ -569,11 +443,6 @@ def main():
     parser.add_argument("--te-target-names", nargs="*", default=["q_proj", "k_proj", "v_proj", "out_proj", "proj"])
     parser.add_argument("--num-images", type=int, default=None)
     parser.add_argument("--device-dtype", choices=["auto", "fp16", "fp32"], default="auto")
-    # 新增：自动提示与融合
-    parser.add_argument("--auto-prompt", action="store_true", help="对输入图片自动生成提示词并与 --prompt 融合")
-    parser.add_argument("--prompt-fusion-mode", choices=["concat","prepend","append","replace"], default="concat", help="自动提示词与用户 prompt 的融合方式")
-    # 新增：采样器选择
-    parser.add_argument("--sampler", type=str, default="ddpm", help="采样器/调度器名称（ddim/pndm/lms/euler/euler_ancestral/dpmsolver/ddpm）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -684,12 +553,6 @@ def main():
         log.error(f"Failed to construct pipeline from {model_path}: {e}")
         raise
 
-    # set sampler/scheduler if requested
-    try:
-        set_scheduler_for_pipe(pipe, args.sampler)
-    except Exception:
-        log.debug("设置 sampler 失败或不可用，使用默认 scheduler。")
-
     # enable optimizations
     try:
         pipe.enable_xformers_memory_efficient_attention()
@@ -784,17 +647,6 @@ def main():
         img = Image.open(img_path).convert("RGB")
         img = resize_input_image(img, max_input_size)
 
-        # 自动提示词（若启用）
-        final_prompt = args.prompt
-        if args.auto_prompt:
-            try:
-                ap = auto_prompt_for_image(img, device, args.prompt, fusion_mode=args.prompt_fusion_mode)
-                final_prompt = ap
-                log.info(f"Auto-prompt generated: {final_prompt}")
-            except Exception as e:
-                log.warning(f"Auto-prompt 失败，使用原 prompt: {e}")
-                final_prompt = args.prompt
-
         # prepare control images for each controlnet
         control_images_for_this_img: List[Optional[Image.Image]] = []
         if control_single_path:
@@ -836,14 +688,13 @@ def main():
         if args.controlnets:
             # default 0.8 for each
             cond_scales = [0.8] * len(controlnet_models)
-
         # generation call with autocast for fp16 on cuda
         try:
             if device_str == "cuda" and dtype == torch.float16:
                 with torch.cuda.amp.autocast():
                     if use_control:
                         result = pipe(
-                            prompt=final_prompt,
+                            prompt=args.prompt,
                             negative_prompt=args.negative,
                             image=img,
                             control_image=control_images_for_this_img,
@@ -856,7 +707,7 @@ def main():
                         )
                     else:
                         result = pipe(
-                            prompt=final_prompt,
+                            prompt=args.prompt,
                             negative_prompt=args.negative,
                             image=img,
                             strength=args.strength,
@@ -868,7 +719,7 @@ def main():
             else:
                 if use_control:
                     result = pipe(
-                        prompt=final_prompt,
+                        prompt=args.prompt,
                         negative_prompt=args.negative,
                         image=img,
                         control_image=control_images_for_this_img,
@@ -881,7 +732,7 @@ def main():
                     )
                 else:
                     result = pipe(
-                        prompt=final_prompt,
+                        prompt=args.prompt,
                         negative_prompt=args.negative,
                         image=img,
                         strength=args.strength,
